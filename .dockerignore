@@ -1,0 +1,6 @@
+.git
+.env
+cookies.txt
+**/__pycache__
+.pytest_cache
+tests
