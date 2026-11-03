@@ -1,9 +1,4 @@
-"""In-process yt-dlp wrapper.
-
-All network access to YouTube *beyond* the public Atom feeds goes through this
-module, which keeps the "0 yt-dlp calls when nothing changed" guarantee easy to
-audit (see ``YtDlpClient.calls``).
-"""
+"""In-process yt-dlp wrapper (metadata only – playback is served by ytdlp2STRM)."""
 
 from __future__ import annotations
 
@@ -193,10 +188,6 @@ class YtDlpClient:
     def probe_video(self, video_id: str) -> dict[str, Any]:
         """Full metadata for one video (``yt-dlp --dump-json --skip-download``)."""
         return self._extract(WATCH_URL.format(video_id), ignore_no_formats_error=True)
-
-    def resolve_stream(self, video_id: str, format_spec: str) -> dict[str, Any]:
-        """Metadata including the selected format's direct CDN URL(s)."""
-        return self._extract(WATCH_URL.format(video_id), format=format_spec)
 
     def flat_playlist(self, playlist_id: str) -> PlaylistListing:
         """``yt-dlp --flat-playlist`` – one request regardless of playlist size."""

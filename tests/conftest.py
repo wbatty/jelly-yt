@@ -9,7 +9,6 @@ import pytest
 
 from jelly_yt.config import Settings
 from jelly_yt.db import Database
-from jelly_yt.feeds import Feed, FeedEntry
 from jelly_yt.ingest import Pipeline
 from jelly_yt.ytdlp import ChannelInfo, PlaylistEntry, PlaylistListing, VideoUnavailable
 
@@ -56,9 +55,6 @@ class FakeYtDlp:
             raise VideoUnavailable(f"Video unavailable: {video_id}")
         return self.videos[video_id]
 
-    def resolve_stream(self, video_id, format_spec):
-        return self.probe_video(video_id)
-
     def flat_playlist(self, playlist_id):
         self.calls += 1
         if playlist_id not in self.playlists:
@@ -101,13 +97,12 @@ class FakeJellyfin:
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         media_root=tmp_path / "media",
-        cookies_path=None,
-        database_path=tmp_path / "data" / "seen.db",
-        proxy_host="10.0.0.5",
-        proxy_port=8080,
+        database_path=tmp_path / "data" / "state.db",
+        ytdlp2strm_url="http://10.0.0.5:5005/",
+        channel_list_path=tmp_path / "ytdlp2strm" / "channel_list.json",
         jellyfin_url="http://jf:8096",
         jellyfin_api_key="key",
-        initial_backfill_limit=3,
+        allowed_telegram_user_ids=frozenset({42}),
     )
 
 
@@ -128,15 +123,6 @@ def pipeline(settings, fake_ytdlp, jellyfin) -> Pipeline:
     p = Pipeline(settings, db, fake_ytdlp, http=httpx.Client(transport=image_transport()), jellyfin=jellyfin)
     yield p
     db.close()
-
-
-def make_feed(entries: list[tuple[str, str, datetime]], channel_id: str = CHANNEL_ID) -> Feed:
-    return Feed(
-        title="Veritasium",
-        channel_id=channel_id,
-        author="Veritasium",
-        entries=[FeedEntry(v, channel_id, t, d, "Veritasium") for v, t, d in entries],
-    )
 
 
 def base_time() -> datetime:

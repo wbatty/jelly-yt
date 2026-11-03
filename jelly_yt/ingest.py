@@ -1,8 +1,10 @@
-"""Core ingestion logic shared by the polling worker and the Telegram bot."""
+"""Curated library: single videos and whole playlists as .strm stubs served by ytdlp2STRM.
+
+Channels are not mirrored here; they are handed to ytdlp2STRM via its channel_list.json.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -12,9 +14,9 @@ from typing import Any
 import httpx
 
 from . import naming
+from .channel_list import add_channel
 from .config import Settings
 from .db import Database, PlaylistItem, Target
-from .feeds import Feed, FeedEntry, FeedError, fetch_feeds
 from .jellyfin import JellyfinClient
 from .library import Library
 from .nfo import EpisodeInfo, ShowInfo, episode_xml, read_unique_id, set_episode_number, tvshow_xml
@@ -22,10 +24,7 @@ from .ytdlp import AuthRequired, ChannelInfo, VideoUnavailable, YtDlpClient, YtD
 
 log = logging.getLogger(__name__)
 
-FEED_MAX_ENTRIES = 15  # YouTube Atom feeds expose at most the 15 newest items
 MAX_ATTEMPTS = 5
-# Playlists without a public Atom feed: always fully synced via yt-dlp (requires cookies).
-PRIVATE_PLAYLISTS = {"WL", "LL"}
 THUMB_URLS = ("https://i.ytimg.com/vi/{}/maxresdefault.jpg", "https://i.ytimg.com/vi/{}/hqdefault.jpg")
 
 
@@ -53,7 +52,6 @@ class SyncReport:
     removed: list[str] = field(default_factory=list)
     renumbered: int = 0
     deferred: list[IngestResult] = field(default_factory=list)
-    skipped: bool = False
     error: str | None = None
     exception: Exception | None = field(default=None, repr=False)
     changed_paths: set[Path] = field(default_factory=set)
@@ -75,15 +73,13 @@ class SyncReport:
     def summary(self) -> str:
         if self.error:
             return f"{self.name or self.target_id}: error – {self.error}"
-        if self.skipped:
-            return f"{self.name or self.target_id}: unchanged"
         parts = [f"{len(self.added)} added"]
         if self.removed:
             parts.append(f"{len(self.removed)} removed")
         if self.renumbered:
             parts.append(f"{self.renumbered} renumbered")
         if self.deferred:
-            parts.append(f"{len(self.deferred)} deferred")
+            parts.append(f"{len(self.deferred)} waiting")
         return f"{self.name or self.target_id}: " + ", ".join(parts)
 
 
@@ -91,7 +87,7 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
-def _published_from_info(info: dict[str, Any], fallback: datetime | None) -> datetime:
+def _published_from_info(info: dict[str, Any]) -> datetime:
     for key in ("release_timestamp", "timestamp"):
         if info.get(key):
             return naming.parse_datetime(info[key])
@@ -99,14 +95,12 @@ def _published_from_info(info: dict[str, Any], fallback: datetime | None) -> dat
         parsed = naming.parse_datetime(info.get(key))
         if parsed:
             return parsed
-    return fallback or naming.utcnow()
+    return naming.utcnow()
 
 
 def _runtime_minutes(info: dict[str, Any]) -> int | None:
     duration = info.get("duration")
-    if not duration:
-        return None
-    return max(1, round(float(duration) / 60))
+    return max(1, round(float(duration) / 60)) if duration else None
 
 
 class Pipeline:
@@ -128,9 +122,6 @@ class Pipeline:
         self.library = Library(settings.media_root)
 
     # ------------------------------------------------------------------ helpers
-    def strm_url(self, video_id: str) -> str:
-        return f"{self.settings.proxy_base_url}/watch?v={video_id}"
-
     def _download_image(self, url: str | None) -> bytes | None:
         if not url:
             return None
@@ -162,7 +153,7 @@ class Pipeline:
         self.db.set_show_folder(show_id, folder)
         return folder
 
-    def _defer(self, video_id: str, exc: Exception | str, *, title: str = "") -> IngestResult:
+    def _defer(self, video_id: str, exc: Exception, *, title: str = "") -> IngestResult:
         now = naming.utcnow()
         if isinstance(exc, VideoUnavailable):  # likely permanent: back off a day per attempt
             self.db.defer(video_id, str(exc), _iso(now + timedelta(hours=24)), True, MAX_ATTEMPTS)
@@ -194,195 +185,78 @@ class Pipeline:
         return [v for v in video_ids if v not in blocked]
 
     # ------------------------------------------------------------------ channels
-    def ensure_channel_show(
-        self,
-        channel_id: str,
-        name_hint: str,
-        channel_info: ChannelInfo | None = None,
-        genres: list[str] | None = None,
-    ) -> tuple[str, str]:
-        """Create ``<Channel>/tvshow.nfo`` + ``poster.jpg`` if missing. Returns (folder, show title)."""
-        target = self.db.get_target(channel_id)
-        show_title = (target.display_name if target else None) or name_hint or channel_id
-        folder = self._folder_for(
-            channel_id, naming.channel_folder(show_title, target.custom_folder if target else None)
-        )
-        if not self.library.has_show(folder):
-            info = channel_info
-            if info is None:
-                try:
-                    info = self.ytdlp.channel_info_by_id(channel_id)
-                except YtDlpError as exc:
-                    log.warning("Channel metadata lookup failed for %s: %s", channel_id, exc)
-                    info = ChannelInfo(channel_id=channel_id, name=show_title)
-            xml = tvshow_xml(
-                ShowInfo(
-                    title=show_title,
-                    unique_id=channel_id,
-                    plot=info.description,
-                    studio=info.name or show_title,
-                    genres=genres or ["YouTube"],
-                )
-            )
-            self.library.write_show(folder, xml, self._download_image(info.avatar_url))
-            log.info("Created show folder %s", folder)
-        return folder, show_title
+    def add_channel(self, channel_url: str) -> bool:
+        """Hand a channel to ytdlp2STRM. Returns True if newly added."""
+        if not self.settings.channel_list_path:
+            raise RuntimeError("YTDLP2STRM_CHANNEL_LIST is not configured")
+        return add_channel(self.settings.channel_list_path, channel_url)
 
-    def ingest_channel_video(
-        self,
-        video_id: str,
-        feed_entry: FeedEntry | None = None,
-        channel_info: ChannelInfo | None = None,
-    ) -> IngestResult:
-        """Ingest one video into ``<Channel>/Season <YYYY>/S<YYYY>E<MMDD> - <Title>``."""
+    # ------------------------------------------------------------------ single videos
+    def ensure_channel_show(self, channel_id: str, name: str, genres: list[str] | None = None) -> str:
+        """Create ``<Channel>/tvshow.nfo`` + ``poster.jpg`` if missing. Returns the folder."""
+        folder = self._folder_for(channel_id, naming.channel_folder(name or channel_id))
+        if not self.library.has_show(folder):
+            try:
+                info = self.ytdlp.channel_info_by_id(channel_id)
+            except YtDlpError as exc:
+                log.warning("Channel metadata lookup failed for %s: %s", channel_id, exc)
+                info = ChannelInfo(channel_id=channel_id, name=name)
+            xml = tvshow_xml(ShowInfo(
+                title=name or info.name, unique_id=channel_id, plot=info.description,
+                studio=info.name or name, genres=genres or ["YouTube"],
+            ))
+            self.library.write_show(folder, xml, self._download_image(info.avatar_url))
+        return folder
+
+    def add_video(self, video_id: str) -> IngestResult:
+        """Bot entry point for a single video: remembered so waiting items are retried later."""
+        self.db.add_request(video_id)
+        result = self.ingest_video(video_id)
+        if result.ok or result.status == "unavailable":
+            self.db.drop_request(video_id)
+        return result
+
+    def ingest_video(self, video_id: str) -> IngestResult:
+        """Write one video into ``<Channel>/Season <YYYY>/S<YYYY>E<MMDD> - <Title>``."""
         if self.db.is_processed(video_id):
-            return IngestResult(video_id, "exists", title=feed_entry.title if feed_entry else "")
-        info, failure = self._probe(video_id, feed_entry.title if feed_entry else "")
+            return IngestResult(video_id, "exists")
+        info, failure = self._probe(video_id)
         if failure:
             return failure
         assert info is not None
 
-        title = info.get("title") or (feed_entry.title if feed_entry else video_id)
-        published = _published_from_info(info, feed_entry.published if feed_entry else None)
-        channel_id = info.get("channel_id") or (feed_entry.channel_id if feed_entry else "") or "unknown"
-        channel_name = (
-            info.get("channel") or info.get("uploader") or (feed_entry.author if feed_entry else "") or channel_id
-        )
+        title = info.get("title") or video_id
+        published = _published_from_info(info)
+        channel_id = info.get("channel_id") or "unknown"
+        channel_name = info.get("channel") or info.get("uploader") or channel_id
         genres = [g for g in (info.get("categories") or []) if g]
 
-        folder, show_title = self.ensure_channel_show(channel_id, channel_name, channel_info, genres=genres)
+        folder = self.ensure_channel_show(channel_id, channel_name, genres)
         rel_stem = f"{folder}/{naming.channel_episode_stem(published, title)}"
-        # Same-day uploads with identical titles would collide; disambiguate with the ID.
         existing_nfo = self.library.path(rel_stem + ".nfo")
         if existing_nfo.exists() and read_unique_id(existing_nfo) not in (None, video_id):
-            rel_stem = f"{rel_stem} [{video_id}]"
+            rel_stem = f"{rel_stem} [{video_id}]"  # same-day, same-title collision
 
-        nfo = episode_xml(
-            EpisodeInfo(
-                title=title,
-                show_title=show_title,
-                season=published.year,
-                episode=int(f"{published.month:02d}{published.day:02d}"),
-                video_id=video_id,
-                plot=info.get("description") or (feed_entry.description if feed_entry else ""),
-                aired=published,
-                runtime_minutes=_runtime_minutes(info),
-                studio=channel_name,
-                genres=genres,
-            )
+        nfo = episode_xml(EpisodeInfo(
+            title=title, show_title=channel_name, season=published.year,
+            episode=int(f"{published.month:02d}{published.day:02d}"), video_id=video_id,
+            plot=info.get("description") or "", aired=published, runtime_minutes=_runtime_minutes(info),
+            studio=channel_name, genres=genres,
+        ))
+        strm = self.library.write_episode(
+            rel_stem, self.settings.strm_url(video_id), nfo, self._thumbnail(video_id, info)
         )
-        strm = self.library.write_episode(rel_stem, self.strm_url(video_id), nfo, self._thumbnail(video_id, info))
         self.db.mark_processed(video_id, channel_id, title, _iso(published))
         self.db.clear_deferred(video_id)
         log.info("Added %s -> %s", video_id, rel_stem)
-        return IngestResult(video_id, "added", title=title, published=published, path=strm, show=show_title)
-
-    def _backfill(
-        self,
-        target: Target,
-        feed: Feed | None,
-        recent_ids: list[str] | None = None,
-        channel_info: ChannelInfo | None = None,
-    ) -> SyncReport:
-        """First sync of a channel: ingest the newest INITIAL_BACKFILL_LIMIT uploads and set a cutoff
-        so older uploads that surface in the feed are ignored on subsequent polls."""
-        report = SyncReport(target.target_id, name=target.display_name)
-        limit = max(0, self.settings.initial_backfill_limit)
-        entries = sorted(
-            (feed.entries if feed else []),
-            key=lambda e: e.published or naming.utcnow(),
-            reverse=True,
-        )
-        by_id = {e.video_id: e for e in entries}
-
-        if feed is not None and (limit <= len(entries) or len(entries) < FEED_MAX_ENTRIES):
-            selected = [e.video_id for e in entries[:limit]]
-        else:
-            if recent_ids is None:
-                try:
-                    recent_ids = self.ytdlp.channel_info_by_id(target.target_id, recent=limit).recent_video_ids
-                except YtDlpError as exc:
-                    report.error = str(exc)
-                    return report
-            selected = list(recent_ids[:limit])
-
-        published_dates = [by_id[v].published for v in selected if v in by_id and by_id[v].published]
-        todo = self._unblocked(self.db.unseen(selected))
-        for vid in reversed(selected):  # oldest first so Jellyfin "Next Up" ordering is natural
-            if vid not in todo:
-                report.existing += 1 if self.db.is_processed(vid) else 0
-                continue
-            result = self.ingest_channel_video(vid, by_id.get(vid), channel_info)
-            report.record(result)
-            if result.published:
-                published_dates.append(result.published)
-
-        cutoff = min(published_dates) if published_dates else naming.utcnow()
-        self.db.update_state(
-            target.target_id, backfill_cutoff=_iso(cutoff), last_polled_at=_iso(naming.utcnow())
-        )
-        return report
-
-    def poll_channel(self, target: Target, feed: Feed) -> SyncReport:
-        state = self.db.get_state(target.target_id)
-        cutoff = naming.parse_datetime(state.backfill_cutoff)
-        if cutoff is None:
-            return self._backfill(target, feed)
-
-        report = SyncReport(target.target_id, name=target.display_name)
-        candidates = [e for e in feed.entries if e.published is None or e.published >= cutoff]
-        todo = set(self._unblocked(self.db.unseen([e.video_id for e in candidates])))
-        report.existing = len(candidates) - len(todo)
-        for entry in sorted(
-            (e for e in candidates if e.video_id in todo), key=lambda e: e.published or naming.utcnow()
-        ):
-            report.record(self.ingest_channel_video(entry.video_id, entry))
-        self.db.update_state(target.target_id, last_polled_at=_iso(naming.utcnow()))
-        return report
-
-    def track_channel(self, channel_url: str, custom_folder: str | None = None) -> tuple[Target, SyncReport]:
-        """Resolve a channel URL/handle, start tracking it and run the baseline backfill."""
-        limit = max(1, self.settings.initial_backfill_limit)
-        info = self.ytdlp.channel_info(channel_url, recent=limit)
-        existing = self.db.get_target(info.channel_id)
-        target = Target(info.channel_id, "channel", existing.display_name if existing else info.name, custom_folder)
-        self.db.add_target(target)
-        target = self.db.get_target(info.channel_id) or target
-        self.ensure_channel_show(target.target_id, target.display_name, channel_info=info)
-
-        feed: Feed | FeedError | None = None
-        try:
-            feed = asyncio.run(
-                fetch_feeds([("channel", target.target_id)], timeout=self.settings.http_timeout_seconds)
-            ).get(target.target_id)
-        except RuntimeError:  # already inside an event loop (should not happen: callers use threads)
-            feed = None
-        feed = feed if isinstance(feed, Feed) else None
-
-        if self.db.get_state(target.target_id).backfill_cutoff:
-            # Already baselined: never move the cutoff; just catch up if the feed is reachable.
-            report = self.poll_channel(target, feed) if feed is not None else SyncReport(
-                target.target_id, name=target.display_name, skipped=True
-            )
-        else:
-            report = self._backfill(target, feed, recent_ids=info.recent_video_ids, channel_info=info)
-        return target, report
+        return IngestResult(video_id, "added", title=title, published=published, path=strm, show=channel_name)
 
     # ------------------------------------------------------------------ playlists
-    def sync_playlist(self, playlist_id: str, feed: Feed | None = None, force: bool = False) -> SyncReport:
-        """Mirror a playlist into ``<Title> [Playlist]/Season 01/S01E<NN>`` (add, renumber, prune)."""
+    def sync_playlist(self, playlist_id: str) -> SyncReport:
+        """Mirror a whole playlist into ``<Title> [Playlist]/Season 01/S01E<NN>`` (add, renumber, prune)."""
         target = self.db.get_target(playlist_id)
         report = SyncReport(playlist_id, name=target.display_name if target else playlist_id)
-        state = self.db.get_state(playlist_id)
         now = naming.utcnow()
-
-        if not force and feed is not None and state.feed_fingerprint == feed.fingerprint():
-            last_full = naming.parse_datetime(state.last_full_sync)
-            if last_full and now - last_full < timedelta(hours=self.settings.playlist_full_resync_hours):
-                report.skipped = True
-                self.db.update_state(playlist_id, last_polled_at=_iso(now))
-                return report
-
         try:
             listing = self.ytdlp.flat_playlist(playlist_id)
         except YtDlpError as exc:
@@ -397,19 +271,13 @@ class Pipeline:
         )
         show_dir = self.library.path(folder)
         if not self.library.has_show(folder):
-            poster_url = listing.thumbnail_url
-            poster = self._download_image(poster_url)
+            poster = self._download_image(listing.thumbnail_url)
             if poster is None and listing.entries:
                 poster = self._thumbnail(listing.entries[0].video_id)
-            xml = tvshow_xml(
-                ShowInfo(
-                    title=show_title,
-                    unique_id=playlist_id,
-                    plot=listing.description,
-                    studio=listing.uploader or "YouTube",
-                    genres=["YouTube", "Playlist"],
-                )
-            )
+            xml = tvshow_xml(ShowInfo(
+                title=show_title, unique_id=playlist_id, plot=listing.description,
+                studio=listing.uploader or "YouTube", genres=["YouTube", "Playlist"],
+            ))
             self.library.write_show(folder, xml, poster)
             report.changed_paths.add(show_dir)
 
@@ -425,10 +293,9 @@ class Pipeline:
                 self.db.delete_playlist_item(playlist_id, vid)
                 report.removed.append(vid)
                 report.changed_paths.add(show_dir)
-                log.info("Pruned %s from playlist %s", vid, playlist_id)
 
         # 2. Renumber survivors whose position changed (two-phase to avoid name clashes).
-        moves: list[tuple[str, int, str, str]] = []  # (video_id, index, old_stem, new_stem)
+        moves = []
         for index, entry in enumerate(entries, start=1):
             item = existing.get(entry.video_id)
             if not item:
@@ -452,23 +319,20 @@ class Pipeline:
             report.changed_paths.add(show_dir)
 
         # 3. Add new items.
-        new_ids = self._unblocked([e.video_id for e in entries if e.video_id not in existing])
-        report.existing = total - len([e for e in entries if e.video_id not in existing])
+        new_entries = [e for e in entries if e.video_id not in existing]
+        new_ids = set(self._unblocked([e.video_id for e in new_entries]))
+        report.existing = total - len(new_entries)
         for index, entry in enumerate(entries, start=1):
             if entry.video_id not in new_ids:
                 continue
-            result = self._ingest_playlist_video(playlist_id, folder, show_title, index, total, entry.video_id,
-                                                 entry.title)
+            result = self._ingest_playlist_video(
+                playlist_id, folder, show_title, index, total, entry.video_id, entry.title
+            )
             report.record(result)
             if result.status == "added":
                 report.changed_paths.add(show_dir)
 
-        self.db.update_state(
-            playlist_id,
-            feed_fingerprint=feed.fingerprint() if feed is not None else state.feed_fingerprint,
-            last_full_sync=_iso(now),
-            last_polled_at=_iso(now),
-        )
+        self.db.update_state(playlist_id, last_full_sync=_iso(now), last_polled_at=_iso(now))
         return report
 
     def _ingest_playlist_video(
@@ -479,23 +343,17 @@ class Pipeline:
             return failure
         assert info is not None
         title = info.get("title") or title_hint or video_id
-        published = _published_from_info(info, None)
+        published = _published_from_info(info)
         rel_stem = f"{folder}/{naming.playlist_episode_stem(index, title, total)}"
-        nfo = episode_xml(
-            EpisodeInfo(
-                title=title,
-                show_title=show_title,
-                season=1,
-                episode=index,
-                video_id=video_id,
-                plot=info.get("description") or "",
-                aired=published,
-                runtime_minutes=_runtime_minutes(info),
-                studio=info.get("channel") or info.get("uploader") or "",
-                genres=[g for g in (info.get("categories") or []) if g],
-            )
+        nfo = episode_xml(EpisodeInfo(
+            title=title, show_title=show_title, season=1, episode=index, video_id=video_id,
+            plot=info.get("description") or "", aired=published, runtime_minutes=_runtime_minutes(info),
+            studio=info.get("channel") or info.get("uploader") or "",
+            genres=[g for g in (info.get("categories") or []) if g],
+        ))
+        strm = self.library.write_episode(
+            rel_stem, self.settings.strm_url(video_id), nfo, self._thumbnail(video_id, info)
         )
-        strm = self.library.write_episode(rel_stem, self.strm_url(video_id), nfo, self._thumbnail(video_id, info))
         self.db.upsert_playlist_item(PlaylistItem(playlist_id, video_id, index, rel_stem))
         self.db.clear_deferred(video_id)
         return IngestResult(video_id, "added", title=title, published=published, path=strm, show=show_title)
@@ -503,45 +361,33 @@ class Pipeline:
     def track_playlist(self, playlist_id: str, custom_folder: str | None = None) -> tuple[Target, SyncReport]:
         existing = self.db.get_target(playlist_id)
         if existing is None:
-            # Register first (display name refined after listing) so custom_folder is honoured.
             self.db.add_target(Target(playlist_id, "playlist", playlist_id, custom_folder))
-        report = self.sync_playlist(playlist_id, force=True)
+        report = self.sync_playlist(playlist_id)
         if report.error and existing is None:
             self.db.remove_target(playlist_id)
             raise report.exception or YtDlpError(report.error)
         display = existing.display_name if existing and existing.display_name != playlist_id else report.name
-        target = Target(playlist_id, "playlist", display, custom_folder)
-        self.db.add_target(target)
-        return self.db.get_target(playlist_id) or target, report
+        self.db.add_target(Target(playlist_id, "playlist", display, custom_folder))
+        return self.db.get_target(playlist_id), report
 
-    # ------------------------------------------------------------------ poll loop
-    def poll_all(self) -> list[SyncReport]:
-        targets = self.db.list_targets()
-        feedable = [(t.target_type, t.target_id) for t in targets if t.target_id not in PRIVATE_PLAYLISTS]
-        feeds = asyncio.run(
-            fetch_feeds(
-                feedable, concurrency=self.settings.feed_concurrency, timeout=self.settings.http_timeout_seconds
-            )
-        )
+    # ------------------------------------------------------------------ periodic
+    def sync_all(self) -> list[SyncReport]:
+        """Resync every tracked playlist and retry waiting single videos."""
         reports: list[SyncReport] = []
-        for target in targets:
-            feed = feeds.get(target.target_id)
+        for target in self.db.list_targets("playlist"):
             try:
-                if target.target_type == "channel":
-                    if not isinstance(feed, Feed):
-                        reports.append(SyncReport(target.target_id, target.display_name, error=str(feed)))
-                        continue
-                    reports.append(self.poll_channel(target, feed))
-                elif target.target_type == "playlist":
-                    reports.append(self.sync_playlist(target.target_id, feed if isinstance(feed, Feed) else None))
-                else:
-                    log.warning("Unknown target type %r for %s", target.target_type, target.target_id)
-            except Exception as exc:  # one broken target must not stop the run
+                reports.append(self.sync_playlist(target.target_id))
+            except Exception as exc:  # one broken playlist must not stop the run
                 log.exception("Sync failed for %s", target.target_id)
                 reports.append(SyncReport(target.target_id, target.display_name, error=str(exc)))
-        changed = set().union(*(r.changed_paths for r in reports)) if reports else set()
-        if any(r.changed for r in reports):
-            self.jellyfin.refresh(sorted(changed))
+
+        pending = self._unblocked(self.db.pending_requests())
+        if pending:
+            singles = SyncReport("videos", name="Single videos")
+            for vid in pending:
+                result = self.add_video(vid)
+                singles.record(result)
+            reports.append(singles)
         return reports
 
     def notify(self, reports: list[SyncReport] | SyncReport) -> bool:
@@ -552,5 +398,4 @@ class Pipeline:
 
 
 def build_pipeline(settings: Settings) -> Pipeline:
-    db = Database(settings.database_path)
-    return Pipeline(settings, db, YtDlpClient(settings.cookies_path))
+    return Pipeline(settings, Database(settings.database_path), YtDlpClient(settings.cookies_path))

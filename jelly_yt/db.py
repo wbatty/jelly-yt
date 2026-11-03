@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS processed_videos (
 
 CREATE TABLE IF NOT EXISTS tracked_targets (
     target_id TEXT PRIMARY KEY, -- Channel ID or Playlist ID
-    target_type TEXT NOT NULL,  -- 'channel' | 'playlist'
+    target_type TEXT NOT NULL,  -- 'playlist' (channels are handed to ytdlp2STRM)
     display_name TEXT NOT NULL,
     custom_folder TEXT
 );
@@ -26,8 +26,6 @@ CREATE TABLE IF NOT EXISTS tracked_targets (
 -- Pipeline bookkeeping beyond the core schema.
 CREATE TABLE IF NOT EXISTS target_state (
     target_id TEXT PRIMARY KEY,
-    backfill_cutoff TEXT,      -- ISO timestamp; feed entries older than this are ignored
-    feed_fingerprint TEXT,     -- hash of the last seen playlist feed (cheap change detection)
     last_full_sync TEXT,       -- ISO timestamp of the last full playlist sync
     last_polled_at TEXT
 );
@@ -49,6 +47,12 @@ CREATE TABLE IF NOT EXISTS deferred_videos (
     gave_up INTEGER NOT NULL DEFAULT 0
 );
 
+-- Single videos requested via the bot that are still waiting (e.g. premieres).
+CREATE TABLE IF NOT EXISTS requested_videos (
+    video_id TEXT PRIMARY KEY,
+    requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Stable folder per show (survives channel renames; honours custom_folder).
 CREATE TABLE IF NOT EXISTS show_folders (
     show_id TEXT PRIMARY KEY,   -- channel ID or playlist ID
@@ -68,8 +72,6 @@ class Target:
 @dataclass(frozen=True)
 class TargetState:
     target_id: str
-    backfill_cutoff: str | None = None
-    feed_fingerprint: str | None = None
     last_full_sync: str | None = None
     last_polled_at: str | None = None
 
@@ -124,6 +126,20 @@ class Database:
             "INSERT OR REPLACE INTO processed_videos (video_id, channel_id, title, published_at) VALUES (?, ?, ?, ?)",
             (video_id, channel_id, title, published_at),
         )
+
+    # -- requested_videos -----------------------------------------------------
+    def add_request(self, video_id: str) -> None:
+        self._exec("INSERT OR IGNORE INTO requested_videos (video_id) VALUES (?)", (video_id,))
+
+    def pending_requests(self) -> list[str]:
+        rows = self._exec(
+            "SELECT r.video_id FROM requested_videos r "
+            "LEFT JOIN processed_videos p ON p.video_id = r.video_id WHERE p.video_id IS NULL"
+        ).fetchall()
+        return [r["video_id"] for r in rows]
+
+    def drop_request(self, video_id: str) -> None:
+        self._exec("DELETE FROM requested_videos WHERE video_id = ?", (video_id,))
 
     # -- deferred_videos ------------------------------------------------------
     def defer(self, video_id: str, reason: str, retry_after: str, count_attempt: bool, max_attempts: int) -> None:
@@ -195,7 +211,7 @@ class Database:
         return TargetState(**dict(row)) if row else TargetState(target_id=target_id)
 
     def update_state(self, target_id: str, **fields: str | None) -> None:
-        allowed = {"backfill_cutoff", "feed_fingerprint", "last_full_sync", "last_polled_at"}
+        allowed = {"last_full_sync", "last_polled_at"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown target_state fields: {unknown}")

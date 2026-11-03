@@ -1,4 +1,6 @@
 from jelly_yt.bot import handle_link
+from jelly_yt.channel_list import read_channels
+from jelly_yt.config import Settings
 from jelly_yt.urls import Link
 from jelly_yt.ytdlp import AuthRequired, ChannelInfo, PlaylistEntry, PlaylistListing
 
@@ -17,17 +19,43 @@ def test_video_link(pipeline, fake_ytdlp):
 
 def test_playlist_link_and_auth_error(pipeline, fake_ytdlp):
     fake_ytdlp.add_video(vid(1), "One", base_time())
-    fake_ytdlp.playlists["WL"] = PlaylistListing("WL", "Watch later", entries=[PlaylistEntry(vid(1), "One")])
-    text, reports = handle_link(pipeline, Link("playlist", "WL"))
-    assert "Watch later" in text and "1 added" in text
-    assert pipeline.db.get_target("WL").target_type == "playlist"
+    fake_ytdlp.playlists["PLkids"] = PlaylistListing("PLkids", "Kids", entries=[PlaylistEntry(vid(1), "One")])
+    text, reports = handle_link(pipeline, Link("playlist", "PLkids"))
+    assert "Kids" in text and "1 videos added" in text
+    assert pipeline.db.get_target("PLkids").target_type == "playlist"
 
     fake_ytdlp.errors[vid(2)] = AuthRequired("cookies")
     text, _ = handle_link(pipeline, Link("video", vid(2)))
-    assert "retry" in text
+    assert "keep trying" in text
 
 
-def test_unknown_playlist_is_not_tracked(pipeline):
+def test_channel_goes_to_ytdlp2strm_list(pipeline, settings):
+    text, reports = handle_link(pipeline, Link("channel", "https://www.youtube.com/@veritasium"))
+    assert "restart" in text and reports == []
+    assert read_channels(settings.channel_list_path) == ["https://www.youtube.com/@veritasium"]
+    text, _ = handle_link(pipeline, Link("channel", "https://www.youtube.com/@veritasium"))
+    assert "already" in text
+
+
+def test_unknown_playlist(pipeline):
     text, _ = handle_link(pipeline, Link("playlist", "PLdoesnotexist"))
     assert "Not available" in text
-    assert pipeline.db.get_target("PLdoesnotexist") is None
+
+
+def test_allowed_users_parsing(monkeypatch):
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "1, 2")
+    assert Settings.from_env().allowed_telegram_user_ids == {1, 2}
+    monkeypatch.delenv("ALLOWED_TELEGRAM_USER_IDS")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_ID", "7")
+    assert Settings.from_env().allowed_telegram_user_ids == {7}
+
+
+def test_application_builds_with_owner_filters(pipeline, settings):
+    from dataclasses import replace
+
+    from jelly_yt.bot import Bot
+
+    app = Bot(replace(settings, telegram_bot_token="123:abc"), pipeline).build()
+    handlers = app.handlers[0]
+    assert len(handlers) == 5
+    assert all(42 in h.filters.user_ids if hasattr(h.filters, "user_ids") else True for h in handlers[:4])

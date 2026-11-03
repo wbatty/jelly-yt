@@ -1,44 +1,36 @@
-# Three small services sharing one image and one media volume.
-# Jellyfin itself is expected to run separately (or add it below) with the
-# same host directory mounted read-only as a "Shows" library.
-
-x-jelly-yt: &jelly-yt
-  build:
-    context: .
-    args:
-      UID: ${PUID:-1000}
-      GID: ${PGID:-1000}
-  image: jelly-yt:latest
-  env_file: .env
-  restart: unless-stopped
-  volumes:
-    - ${MEDIA_ROOT_HOST:-/srv/media/youtube}:/srv/media/youtube
+# The bot runs next to ytdlp2STRM (https://github.com/fe80Grau/ytdlp2STRM).
+# Both containers mount the same media folder and the same channel_list.json.
 
 services:
-  proxy:
-    <<: *jelly-yt
-    command: ["python", "-m", "jelly_yt.proxy"]
-    ports:
-      - "${PROXY_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
-      interval: 60s
-      timeout: 5s
-      retries: 3
-
-  worker:
-    <<: *jelly-yt
-    command: ["python", "-m", "jelly_yt.ingest_worker", "run"]
-
   bot:
-    <<: *jelly-yt
-    command: ["python", "-m", "jelly_yt.bot"]
+    build:
+      context: .
+      args:
+        UID: ${PUID:-1000}
+        GID: ${PGID:-1000}
+    image: jelly-yt-bot:latest
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ${MEDIA_HOST:-/srv/media}:/media
+      # Same file ytdlp2STRM mounts as plugins/youtube/channel_list.json
+      - ${CHANNEL_LIST_HOST:-./ytdlp2strm/channel_list.json}:/config/channel_list.json
+      # Optional: YouTube cookies (Netscape format) for private/age-restricted items
+      # - ./cookies.txt:/config/cookies.txt:ro
 
-  # jellyfin:
-  #   image: jellyfin/jellyfin:10.10.7
-  #   network_mode: host
-  #   volumes:
-  #     - ./jellyfin/config:/config
-  #     - ./jellyfin/cache:/cache
-  #     - ${MEDIA_ROOT_HOST:-/srv/media/youtube}:/srv/media/youtube:ro
-  #   restart: unless-stopped
+  # Example ytdlp2STRM service (skip if you already run it elsewhere).
+  ytdlp2strm:
+    image: fe80grau/ytdlp2strm
+    environment:
+      - AM_I_IN_A_DOCKER_CONTAINER=Yes
+      - DOCKER_PORT=5005
+    volumes:
+      - ${MEDIA_HOST:-/srv/media}:/media
+      - ${CHANNEL_LIST_HOST:-./ytdlp2strm/channel_list.json}:/opt/ytdlp2STRM/plugins/youtube/channel_list.json
+      - ytdlp2strm-data:/opt/ytdlp2STRM
+    ports:
+      - "5005:5000"
+    restart: unless-stopped
+
+volumes:
+  ytdlp2strm-data:

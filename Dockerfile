@@ -16,11 +16,10 @@ COPY pyproject.toml README.md ./
 COPY jelly_yt ./jelly_yt
 RUN pip install --no-deps .
 
-# Match the UID/GID that owns MEDIA_ROOT on the host (and that Jellyfin can read).
+# Match the UID/GID that owns the media folder on the host.
 ARG UID=1000
 ARG GID=1000
 RUN groupadd -g ${GID} app && useradd -u ${UID} -g ${GID} -M -s /usr/sbin/nologin app
 USER app
 
-EXPOSE 8080
-CMD ["python", "-m", "jelly_yt.proxy"]
+CMD ["python", "-m", "jelly_yt.bot"]

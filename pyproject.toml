@@ -5,14 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jelly-yt"
 version = "1.0.0"
-description = "Ad-free YouTube subscriptions and playlists in Jellyfin via .strm stubs, .nfo sidecars and an on-demand stream proxy"
+description = "Telegram bot that adds YouTube playlists, single videos and channels to Jellyfin via ytdlp2STRM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "yt-dlp[default]>=2025.11.12",
     "httpx>=0.27,<1",
-    "starlette>=0.37",
-    "uvicorn>=0.30",
     "python-telegram-bot>=21,<23",
 ]
 
@@ -20,8 +18,6 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
-jelly-yt-proxy = "jelly_yt.proxy:main"
-jelly-yt-worker = "jelly_yt.ingest_worker:main"
 jelly-yt-bot = "jelly_yt.bot:main"
 
 [tool.setuptools.packages.find]
